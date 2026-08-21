@@ -1,12 +1,12 @@
-use axum::{extract::State, Json, response::IntoResponse};
-use serde::Serialize;
+use crate::AppState;
 use crate::error::AppError;
 use crate::fapshi::FapshiClient;
-use crate::AppState;
-use sqlx::Row;
-use sqlx::PgConnection;
-use uuid::Uuid;
+use axum::{Json, extract::State, response::IntoResponse};
 use chrono::Utc;
+use serde::Serialize;
+use sqlx::PgConnection;
+use sqlx::Row;
+use uuid::Uuid;
 
 #[derive(Serialize)]
 pub struct ProcessReleasesResponse {
@@ -64,7 +64,7 @@ pub async fn handle_purchase_success_db(
     sqlx::query(
         "INSERT INTO escrow_transactions (transaction_id, status, created_at, updated_at) \
          VALUES ($1, 'held', $2, $2) \
-         ON CONFLICT (transaction_id) DO UPDATE SET status = 'held', updated_at = $2"
+         ON CONFLICT (transaction_id) DO UPDATE SET status = 'held', updated_at = $2",
     )
     .bind(tx_id)
     .bind(now)
@@ -87,17 +87,18 @@ pub async fn handle_purchase_success_db(
     Ok(())
 }
 
-pub async fn release_escrow(
-    state: &AppState,
-    tx_id: Uuid,
-) -> Result<(), AppError> {
+pub async fn release_escrow(state: &AppState, tx_id: Uuid) -> Result<(), AppError> {
     // 1. Claim in-progress lock to mitigate concurrent execution / double payout risk
     {
-        let mut in_progress = state.in_progress_payouts.lock().map_err(|_| {
-            AppError::Internal("Failed to acquire in-progress lock".to_string())
-        })?;
+        let mut in_progress = state
+            .in_progress_payouts
+            .lock()
+            .map_err(|_| AppError::Internal("Failed to acquire in-progress lock".to_string()))?;
         if in_progress.contains(&tx_id) {
-            return Err(AppError::BadRequest(format!("Payout for transaction {} is already in progress", tx_id)));
+            return Err(AppError::BadRequest(format!(
+                "Payout for transaction {} is already in progress",
+                tx_id
+            )));
         }
         in_progress.insert(tx_id);
     }
@@ -127,7 +128,7 @@ pub async fn release_escrow(
          t.status as tx_status, e.status as escrow_status \
          FROM transactions t \
          JOIN escrow_transactions e ON t.id = e.transaction_id \
-         WHERE t.id = $1"
+         WHERE t.id = $1",
     )
     .bind(tx_id)
     .fetch_optional(&state.pool)
@@ -145,7 +146,12 @@ pub async fn release_escrow(
             }
             row
         }
-        None => return Err(AppError::BadRequest(format!("Transaction {} not found", tx_id))),
+        None => {
+            return Err(AppError::BadRequest(format!(
+                "Transaction {} not found",
+                tx_id
+            )));
+        }
     };
 
     let listing_id: Uuid = tx.get("listing_id");
@@ -155,16 +161,19 @@ pub async fn release_escrow(
     let payment_reference: String = tx.get("payment_reference");
 
     // 3. Fetch seller profile
-    let seller_row = sqlx::query(
-        "SELECT whatsapp_number, full_name FROM profiles WHERE id = $1"
-    )
-    .bind(seller_id)
-    .fetch_optional(&state.pool)
-    .await?;
+    let seller_row = sqlx::query("SELECT whatsapp_number, full_name FROM profiles WHERE id = $1")
+        .bind(seller_id)
+        .fetch_optional(&state.pool)
+        .await?;
 
     let seller = match seller_row {
         Some(row) => row,
-        None => return Err(AppError::BadRequest(format!("Seller profile {} not found", seller_id))),
+        None => {
+            return Err(AppError::BadRequest(format!(
+                "Seller profile {} not found",
+                seller_id
+            )));
+        }
     };
 
     let whatsapp_number: Option<String> = seller.get("whatsapp_number");
@@ -172,7 +181,11 @@ pub async fn release_escrow(
 
     let phone = match whatsapp_number {
         Some(num) if !num.trim().is_empty() => num,
-        _ => return Err(AppError::BadRequest("Seller has no payout number configured".to_string())),
+        _ => {
+            return Err(AppError::BadRequest(
+                "Seller has no payout number configured".to_string(),
+            ));
+        }
     };
 
     let payout_amount = amount - commission_amount.unwrap_or(0.0);
@@ -180,30 +193,42 @@ pub async fn release_escrow(
     let seller_name_str = full_name.unwrap_or_else(|| "BookBridge Seller".to_string());
 
     // Check if payout was already executed successfully on Fapshi in a previous run
-    let mut trans_id = match fapshi.check_existing_payout(&state.pool, &external_id).await {
+    let mut trans_id = match fapshi
+        .check_existing_payout(&state.pool, &external_id)
+        .await
+    {
         Ok(Some(tid)) => {
-            tracing::info!("Payout for transaction {} already completed on Fapshi (transId: {}). Skipping payout call.", tx_id, tid);
+            tracing::info!(
+                "Payout for transaction {} already completed on Fapshi (transId: {}). Skipping payout call.",
+                tx_id,
+                tid
+            );
             Some(tid)
         }
         Ok(None) => None, // Safe to proceed with payout
         Err(e) => {
-            tracing::error!("Could not verify prior payout status for tx {}: {:?}. Aborting to prevent potential double-payout.", tx_id, e);
+            tracing::error!(
+                "Could not verify prior payout status for tx {}: {:?}. Aborting to prevent potential double-payout.",
+                tx_id,
+                e
+            );
             return Err(e); // Fail closed - let the next cron run retry
         }
     };
 
     // If not already processed, execute payout
     if trans_id.is_none() {
-        let tid = fapshi.execute_payout(
-            &state.pool,
-            tx_id,
-            payout_amount,
-            &phone,
-            &seller_name_str,
-            &external_id,
-            listing_id,
-        )
-        .await?;
+        let tid = fapshi
+            .execute_payout(
+                &state.pool,
+                tx_id,
+                payout_amount,
+                &phone,
+                &seller_name_str,
+                &external_id,
+                listing_id,
+            )
+            .await?;
         trans_id = Some(tid);
     }
 
@@ -215,7 +240,7 @@ pub async fn release_escrow(
 
     sqlx::query(
         "UPDATE escrow_transactions SET status = 'released', updated_at = $1 \
-         WHERE transaction_id = $2 AND status = 'held'"
+         WHERE transaction_id = $2 AND status = 'held'",
     )
     .bind(now)
     .bind(tx_id)
@@ -244,7 +269,7 @@ pub async fn process_releases_handler(
     // Find all held escrows whose release_deadline has passed
     let expired_rows = sqlx::query(
         "SELECT transaction_id FROM escrow_transactions \
-         WHERE status = 'held' AND release_deadline <= $1"
+         WHERE status = 'held' AND release_deadline <= $1",
     )
     .bind(now)
     .fetch_all(&state.pool)
@@ -293,11 +318,11 @@ pub async fn poll_pending_handler(
 
     // Find all transactions stuck in pending_payment for more than 10 minutes
     let ten_minutes_ago = Utc::now() - chrono::Duration::minutes(10);
-    
+
     let txs = sqlx::query(
         "SELECT id, payment_reference, listing_id, buyer_id, seller_id, amount \
          FROM transactions \
-         WHERE status = 'pending_payment' AND created_at <= $1"
+         WHERE status = 'pending_payment' AND created_at <= $1",
     )
     .bind(ten_minutes_ago)
     .fetch_all(&state.pool)
@@ -314,7 +339,10 @@ pub async fn poll_pending_handler(
 
         tracing::info!("Checking Fapshi status for transaction ref: {}", reference);
 
-        match fapshi.poll_payment_status(&state.pool, tx_id, &reference).await {
+        match fapshi
+            .poll_payment_status(&state.pool, tx_id, &reference)
+            .await
+        {
             Ok(fapshi_status) => {
                 let status_upper = fapshi_status.to_uppercase();
                 if status_upper == "SUCCESSFUL" || status_upper == "SUCCESS" {
@@ -329,8 +357,13 @@ pub async fn poll_pending_handler(
                         seller_id,
                         tx_id,
                         now,
-                    ).await {
-                        tracing::error!("Error writing successful purchase updates to DB during poll: {:?}", e);
+                    )
+                    .await
+                    {
+                        tracing::error!(
+                            "Error writing successful purchase updates to DB during poll: {:?}",
+                            e
+                        );
                         transaction.rollback().await?;
                         results.push(PollResult {
                             id: tx_id,
@@ -374,7 +407,11 @@ pub async fn poll_pending_handler(
             }
             Err(e) => {
                 let err_str = e.to_string();
-                tracing::error!("Error polling transaction status for {}: {}", reference, err_str);
+                tracing::error!(
+                    "Error polling transaction status for {}: {}",
+                    reference,
+                    err_str
+                );
                 results.push(PollResult {
                     id: tx_id,
                     reference: reference.clone(),
